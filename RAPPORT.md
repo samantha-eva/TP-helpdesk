@@ -75,3 +75,37 @@ C'est pas à 100% partout et c'est normal :
 - **prisma.ts** : c'est juste le client Prisma qui se connecte à la DB, y'a rien à tester unitairement là-dedans.
 
 Pour les routes API et les pages React c'est à 0% mais c'est logique, on fait des tests unitaires sur les fonctions utilitaires, pas des tests d'intégration sur les endpoints.
+
+---
+
+## ÉTAPE 3 — Tests de montée en charge avec k6
+
+### Question 7 : Que signifient les métriques `http_req_duration`, `http_req_failed`, `iterations` ?
+
+- **http_req_duration** : c'est le temps que met chaque requête HTTP du début à la fin (envoi + attente + réception). On a le avg, le min, le max et les percentiles (p90, p95). C'est la métrique principale pour savoir si l'app est rapide ou pas.
+- **http_req_failed** : c'est le pourcentage de requêtes qui ont échoué (status 4xx/5xx ou timeout). Dans mon smoke test c'était à 0%, donc tout allait bien.
+- **iterations** : c'est le nombre de fois que la fonction de test a été exécutée en entier. Chaque itération fait plusieurs requêtes (healthcheck + list tickets + create ticket dans le load test).
+
+### Question 8 : Que se passe-t-il si on coupe l'app pendant le smoke test ?
+
+Si on coupe l'app (genre `docker compose down`) pendant que k6 tourne, toutes les requêtes vont échouer avec des erreurs de connexion (connection refused). Le `http_req_failed` va monter à 100% et les thresholds vont être dépassés. k6 va finir par s'arrêter avec des erreurs partout.
+
+### Question 9 : p95 et seuil
+
+Mon p95 sur le load test est de **1612 ms**. Le seuil défini dans le script est `p(95)<500`, donc il est **dépassé**. L'erreur `thresholds on metrics 'http_req_duration' have been crossed` le confirme. L'app n'arrive pas à tenir la charge à 50 VUs.
+
+### Question 10 : Taux d'erreur et RPS
+
+- **Taux d'erreur** : 0.00%, aucune requête n'a échoué, l'app répond toujours mais lentement.
+- **Requêtes totales** : 11017 en 4 minutes, ça fait environ **46 RPS**.
+- **Itérations** : 3672 (chaque itération fait 3 requêtes : health + list + create).
+
+Le problème c'est pas les erreurs, c'est la latence qui explose quand y'a trop d'utilisateurs en même temps. SQLite gère mal les accès concurrents en écriture.
+
+### Question 11 : Utilisation CPU/RAM au pic
+
+Pendant le load test, j'ai lancé `docker stats helpdesk-app` dans un autre terminal. Au pic de charge (50 VUs) :
+- **CPU** : ~1650% (ça parait énorme mais c'est parce que Docker affiche le % par core, donc sur ma machine avec plusieurs cores ça monte vite)
+- **RAM** : ~580 MiB
+
+Ça montre que l'app consomme pas mal de ressources sous charge. Le CPU explose surtout à cause des écritures SQLite qui bloquent les unes les autres (pas de vrai accès concurrent en écriture avec SQLite).
