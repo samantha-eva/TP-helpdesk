@@ -217,3 +217,59 @@ C'est pour dire que le deploy ne se lance que si les 3 autres jobs ont réussi a
 C'est utilisé sur le job `security` (npm audit et Trivy). Ça veut dire que même si l'audit trouve des vulnérabilités, le pipeline continue et passe pas en rouge.
 
 C'est pratique pour pas bloquer le développement quand y'a des vulnérabilités dans des dépendances qu'on peut pas forcément corriger tout de suite (genre Next.js 14 qui a des CVE mais on peut pas migrer vers la 15 en 5 min). Mais c'est pas top comme pratique parce que du coup on peut ignorer des failles critiques sans s'en rendre compte. L'idéal ce serait de mettre `continue-on-error: false` et de gérer les exceptions au cas par cas, ou de filtrer par niveau de sévérité.
+
+---
+
+## ÉTAPE 6 — Déploiement Azure
+
+L'app est déployée sur **Azure App Service** via **Azure Container Registry**.
+
+- URL : https://helpdesk-st.azurewebsites.net
+- Le healthcheck répond `{"status":"ok"}`
+- On peut se connecter et créer des tickets
+
+---
+
+## Synthèse finale
+
+### 1. Architecture finale
+
+```
+Dev local          GitHub              CI/CD                 Azure
+─────────         ────────           ─────────            ──────────
+
+ Code        ──>  git push   ──>   GitHub Actions    ──>  ACR (registry)
+ Next.js           main             - test (lint+unit)      │
+ Prisma                              - security (audit)      │
+ SQLite                              - docker (build)        v
+                                     - deploy           App Service (B1)
+                                                         helpdesk-st
+                                                        .azurewebsites.net
+```
+
+En gros : je code en local, je push sur GitHub, la CI lance les tests + l'audit sécu + le build Docker. Si tout passe et qu'on est sur main, ça pousse l'image sur Azure Container Registry et ça redéploie sur App Service.
+
+### 2. 3 améliorations DevSecOps
+
+1. **Azure Key Vault pour les secrets** : là le JWT_SECRET est en clair dans les app settings. Avec Key Vault on le stocke dans un coffre-fort chiffré et l'app le récupère au runtime. C'est plus sécurisé si quelqu'un accède au portail Azure.
+
+2. **Monitoring avec Application Insights** : pour l'instant on a aucune visibilité sur ce qui se passe en prod. Avec App Insights on aurait les temps de réponse, les erreurs, l'utilisation CPU/RAM en temps réel, et des alertes si ça dépasse un seuil.
+
+3. **Remplacer SQLite par PostgreSQL** : SQLite c'est bien pour le dev mais en prod ça gère pas les accès concurrents (on l'a vu avec k6, le p95 explose). Avec un vrai PostgreSQL (Azure Database for PostgreSQL) les perfs seraient bien meilleures et les données plus fiables.
+
+### 3. Coût Azure estimé
+
+- **App Service Plan B1** : ~13€/mois
+- **Container Registry Basic** : ~5€/mois
+- **Total** : ~18€/mois
+
+Avec les 100$ de crédit étudiant, ça tient environ 5 mois. Pour le TP ça a coûté quasi rien vu que c'est quelques heures d'utilisation.
+
+### 4. Difficultés rencontrées
+
+- **Port 3000 occupé** : au début le serveur Next.js en mode dev bloquait le port, j'ai dû le kill avant de lancer le conteneur Docker.
+- **Prisma dans le conteneur** : `npx prisma` téléchargeait la v7 alors que le projet utilise la v5.22. Il fallait préciser `npx prisma@5.22.0`.
+- **bcryptjs manquant** : le build standalone de Next.js n'inclut pas bcryptjs, donc le seed crashait dans le conteneur. Il fallait l'installer manuellement.
+- **Trivy via snap** : Trivy installé via snap avait un problème de sandbox et pouvait pas accéder aux fichiers Docker. J'ai dû le réinstaller via le script officiel.
+- **SSH Azure** : impossible de SSH dans le conteneur sur App Service parce que notre image n'a pas de serveur SSH. J'ai contourné en ajoutant un script `start.sh` qui fait le migrate + seed au démarrage.
+- **Settings Azure écrasés** : une commande `az webapp config appsettings set` écrasait les settings existants, il fallait tout remettre d'un coup.
