@@ -109,49 +109,47 @@ Pendant le load test, j'ai lancé `docker stats helpdesk-app` dans un autre term
 - **RAM** : ~580 MiB
 
 Ça montre que l'app consomme pas mal de ressources sous charge. Le CPU explose surtout à cause des écritures SQLite qui bloquent les unes les autres (pas de vrai accès concurrent en écriture avec SQLite).
-
+*
 ---
 
 ## ÉTAPE 4 — Sécurité
 
 ### Question 12 : Vulnérabilités `npm audit`
 
-J'ai lancé `npm audit` et j'ai **11 vulnérabilités** au total : 7 moderate et 4 high. Pas de critique.
+`npm audit` remonte **11 vulnérabilités** (7 moderate, 4 high). Aucune critique.
 
-Les principales :
-- **Next.js (14.2.33)** : y'a plein de CVE dessus, surtout des DoS via les Server Components et du cache poisoning. Par exemple GHSA-mwv6-3258-q52c, un attaquant peut envoyer des requêtes bizarres qui font planter les Server Components → l'app devient inaccessible. C'est corrigé dans Next 14.2.34 mais on est bloqué sur la 14.2.33.
-- **glob (10.4.2)** — CVE-2025-64756 : c'est une injection de commande via des noms de fichiers malicieux. En gros si l'app traite des fichiers avec des noms spéciaux ça peut exécuter du code.
+Les plus importantes :
+- **Next.js (14.2.33)** : plusieurs CVE liées à des attaques DoS via les Server Components, du cache poisoning, et du XSS. Par exemple GHSA-mwv6-3258-q52c : un attaquant peut envoyer des requêtes spéciales qui font planter les Server Components, ce qui rend l'app indisponible (Denial of Service). C'est fixé dans Next 14.2.34+.
+- **glob (10.4.2)** — CVE-2025-64756 : injection de commande via des noms de fichiers malicieux quand on utilise l'option `--cmd`. Un attaquant pourrait exécuter du code arbitraire si l'app traite des noms de fichiers non sanitisés.
 
 ### Question 13 : Vulnérabilités Trivy vs npm audit
 
-Trivy trouve **18 vulnérabilités HIGH** dans l'image Docker. Ce qui est intéressant c'est que certaines apparaissent pas du tout dans `npm audit` :
+Trivy trouve **18 vulnérabilités HIGH** dans l'image Docker, dont certaines que `npm audit` ne voit pas :
 
-- **cross-spawn (7.0.3)** — CVE-2024-21538 : un ReDoS (l'attaquant envoie une string qui fait boucler la regex). C'est utilisé par npm dans l'image, pas par notre app directement.
-- **tar (6.2.1)** : 6 CVEs, que des failles de path traversal. Un attaquant pourrait écraser des fichiers en créant des archives piégées. Ça vient de npm dans `/usr/local/lib/node_modules/npm/`.
-- **minimatch (9.0.5)** : 3 CVEs de DoS, des regex qui partent en boucle infinie avec certains patterns.
+- **cross-spawn (7.0.3)** — CVE-2024-21538 : ReDoS (Regular Expression Denial of Service). C'est un package système utilisé par npm lui-même dans l'image, pas directement dans notre code.
+- **tar (6.2.1)** — 6 CVEs : des failles de path traversal et d'écrasement de fichiers via des archives malicieuses. Ces vulnérabilités viennent de npm qui est installé dans l'image Node.js (dans `/usr/local/lib/node_modules/npm/`).
+- **minimatch (9.0.5)** — 3 CVEs de type DoS par backtracking catastrophique dans les expressions glob.
 
-En fait ces failles viennent pas de notre code, elles sont dans **l'image de base node:20-alpine** et dans les outils pré-installés (npm, yarn). `npm audit` les voit pas parce qu'il regarde que les dépendances de notre `package.json`, pas ce qui est installé dans l'OS de l'image Docker.
+Ces vulnérabilités viennent pas de notre code mais de **l'image de base node:20-alpine** et des outils système (npm, yarn) pré-installés dedans. C'est pour ça que `npm audit` ne les voit pas : il scanne seulement les dépendances du projet, pas les outils système de l'image Docker.
 
 ### Exercice 4.3.1 — JWT secret faible
 
-J'ai récupéré mon token USER via `localStorage.getItem('token')` dans la console du navigateur. Sur jwt.io, j'ai vu le payload en clair avec `"role": "USER"`.
+J'ai récupéré le token JWT d'un compte USER via `localStorage.getItem('token')` dans la console du navigateur. En le décodant sur jwt.io, j'ai pu voir le payload en clair (userId, email, role: "USER").
 
-Le truc c'est que le secret dans `.env.example` est `change-me-in-production-use-a-strong-secret-key-please`, et c'est le même qui est utilisé. Du coup j'ai changé le rôle en `"ADMIN"`, resigné avec ce secret, et avec le nouveau token j'ai pu :
-- Voir **tous** les tickets (alors que normalement un USER voit que les siens)
-- **Supprimer** un ticket avec `DELETE /api/tickets/<id>` → ça renvoie `{"ok":true}`
+Le secret du `.env.example` est `change-me-in-production-use-a-strong-secret-key-please`. En l'utilisant pour signer un nouveau token avec `"role": "ADMIN"`, j'ai pu :
+- Lister **tous** les tickets (pas juste les miens)
+- **Supprimer** un ticket avec `DELETE /api/tickets/<id>` → réponse `{"ok":true}`
 
-Ça marche parce que l'app vérifie juste la signature du JWT et fait confiance au rôle qui est dedans sans vérifier en base.
+Ça marche parce que l'app fait confiance au contenu du JWT sans vérifier en base de données si l'utilisateur a vraiment ce rôle.
 
-**3 trucs à faire pour corriger ça :**
-1. Mettre un vrai secret aléatoire et long (avec `openssl rand -base64 64` par exemple), pas le même que celui de l'example
-2. Vérifier le rôle en base de données à chaque requête importante, pas juste se fier au JWT
-3. Réduire la durée du token (1h au lieu de 7 jours) et utiliser des refresh tokens
+**3 mitigations possibles :**
+1. Utiliser un secret long et aléatoire (genre `openssl rand -base64 64`), jamais le même que dans `.env.example`
+2. Vérifier le rôle en base de données à chaque requête sensible, pas juste dans le JWT
+3. Mettre une durée d'expiration courte sur les tokens (genre 1h au lieu de 7 jours) et utiliser des refresh tokens
 
 ### Exercice 4.3.2 — IDOR (Authorization bypass)
 
-J'ai testé en tant que `user@helpdesk.io` d'accéder au ticket d'un autre utilisateur et j'ai eu un 403 Forbidden. L'API est bien protégée contre l'IDOR.
-
-Dans le code (`src/app/api/tickets/[id]/route.ts` lignes 28-29) :
+L'API protège bien contre l'IDOR. Dans `src/app/api/tickets/[id]/route.ts`, lignes 28-29 :
 
 ```typescript
 if (auth.role === 'USER' && ticket.authorId !== auth.userId) {
@@ -159,11 +157,11 @@ if (auth.role === 'USER' && ticket.authorId !== auth.userId) {
 }
 ```
 
-En gros, un USER peut voir/modifier que ses propres tickets. Les AGENT et ADMIN voient tout, ce qui est normal pour le support.
+Un USER ne peut voir/modifier que ses propres tickets. Si on essaie d'accéder au ticket d'un autre user, on reçoit un 403 Forbidden. Par contre les AGENT et ADMIN peuvent voir tous les tickets, ce qui est le comportement voulu.
 
 ### Exercice 4.3.3 — Headers de sécurité manquants
 
-J'ai fait `curl -I http://localhost:3000` et voilà ce que j'ai eu :
+En faisant `curl -I http://localhost:3000`, voici les headers de réponse :
 
 ```
 HTTP/1.1 200 OK
@@ -175,13 +173,13 @@ Content-Type: text/html; charset=utf-8
 
 ### Question 16 : Headers manquants
 
-Y'a aucun header de sécurité, il manque :
-- **Content-Security-Policy (CSP)** : ça empêche le chargement de scripts non autorisés, ça protège contre le XSS
-- **X-Frame-Options** : ça empêche quelqu'un de mettre notre site dans une iframe pour faire du clickjacking
-- **Strict-Transport-Security (HSTS)** : ça force le HTTPS, comme ça même si quelqu'un tape http:// il est redirigé
-- **X-Content-Type-Options** : ça empêche le navigateur de deviner le type de fichier, sinon il pourrait exécuter un fichier malicieux
+Il manque :
+- **Content-Security-Policy (CSP)** : empêche le chargement de scripts/styles non autorisés (protection XSS)
+- **X-Frame-Options** : empêche l'app d'être chargée dans une iframe (protection clickjacking)
+- **Strict-Transport-Security (HSTS)** : force l'utilisation de HTTPS
+- **X-Content-Type-Options** : empêche le navigateur de deviner le type MIME (protection sniffing)
 
-Pour corriger ça on peut ajouter un middleware Next.js :
+Voici un middleware Next.js qui les ajoute :
 
 ```typescript
 // src/middleware.ts
@@ -199,77 +197,3 @@ export function middleware(request: NextRequest) {
   return response;
 }
 ```
-
----
-
-## ÉTAPE 5 — CI/CD GitHub Actions
-
-### Question 17 : Pourquoi le job `deploy` a `needs: [test, security, docker]` ?
-
-C'est pour dire que le deploy ne se lance que si les 3 autres jobs ont réussi avant. Ça évite de déployer en prod du code qui a des tests qui cassent, des failles de sécu, ou une image Docker qui build pas. C'est un peu le principe du pipeline : chaque étape valide quelque chose, et si ça passe pas on déploie pas.
-
-### Question 18 : Que fait `if: github.ref == 'refs/heads/main'` ?
-
-Ça fait que le job `deploy` se lance **uniquement** quand on push sur la branche `main`. Si on push sur `develop` ou sur une autre branche, les jobs test/security/docker tournent mais le deploy est skip. C'est logique parce qu'on veut pas déployer en prod à chaque commit sur une branche de dev.
-
-### Question 19 : `continue-on-error: true` est-ce une bonne pratique ?
-
-C'est utilisé sur le job `security` (npm audit et Trivy). Ça veut dire que même si l'audit trouve des vulnérabilités, le pipeline continue et passe pas en rouge.
-
-C'est pratique pour pas bloquer le développement quand y'a des vulnérabilités dans des dépendances qu'on peut pas forcément corriger tout de suite (genre Next.js 14 qui a des CVE mais on peut pas migrer vers la 15 en 5 min). Mais c'est pas top comme pratique parce que du coup on peut ignorer des failles critiques sans s'en rendre compte. L'idéal ce serait de mettre `continue-on-error: false` et de gérer les exceptions au cas par cas, ou de filtrer par niveau de sévérité.
-
----
-
-## ÉTAPE 6 — Déploiement Azure
-
-L'app est déployée sur **Azure App Service** via **Azure Container Registry**.
-
-- URL : https://helpdesk-st.azurewebsites.net
-- Le healthcheck répond `{"status":"ok"}`
-- On peut se connecter et créer des tickets
-
----
-
-## Synthèse finale
-
-### 1. Architecture finale
-
-```
-Dev local          GitHub              CI/CD                 Azure
-─────────         ────────           ─────────            ──────────
-
- Code        ──>  git push   ──>   GitHub Actions    ──>  ACR (registry)
- Next.js           main             - test (lint+unit)      │
- Prisma                              - security (audit)      │
- SQLite                              - docker (build)        v
-                                     - deploy           App Service (B1)
-                                                         helpdesk-st
-                                                        .azurewebsites.net
-```
-
-En gros : je code en local, je push sur GitHub, la CI lance les tests + l'audit sécu + le build Docker. Si tout passe et qu'on est sur main, ça pousse l'image sur Azure Container Registry et ça redéploie sur App Service.
-
-### 2. 3 améliorations DevSecOps
-
-1. **Azure Key Vault pour les secrets** : là le JWT_SECRET est en clair dans les app settings. Avec Key Vault on le stocke dans un coffre-fort chiffré et l'app le récupère au runtime. C'est plus sécurisé si quelqu'un accède au portail Azure.
-
-2. **Monitoring avec Application Insights** : pour l'instant on a aucune visibilité sur ce qui se passe en prod. Avec App Insights on aurait les temps de réponse, les erreurs, l'utilisation CPU/RAM en temps réel, et des alertes si ça dépasse un seuil.
-
-3. **Remplacer SQLite par PostgreSQL** : SQLite c'est bien pour le dev mais en prod ça gère pas les accès concurrents (on l'a vu avec k6, le p95 explose). Avec un vrai PostgreSQL (Azure Database for PostgreSQL) les perfs seraient bien meilleures et les données plus fiables.
-
-### 3. Coût Azure estimé
-
-- **App Service Plan B1** : ~13€/mois
-- **Container Registry Basic** : ~5€/mois
-- **Total** : ~18€/mois
-
-Avec les 100$ de crédit étudiant, ça tient environ 5 mois. Pour le TP ça a coûté quasi rien vu que c'est quelques heures d'utilisation.
-
-### 4. Difficultés rencontrées
-
-- **Port 3000 occupé** : au début le serveur Next.js en mode dev bloquait le port, j'ai dû le kill avant de lancer le conteneur Docker.
-- **Prisma dans le conteneur** : `npx prisma` téléchargeait la v7 alors que le projet utilise la v5.22. Il fallait préciser `npx prisma@5.22.0`.
-- **bcryptjs manquant** : le build standalone de Next.js n'inclut pas bcryptjs, donc le seed crashait dans le conteneur. Il fallait l'installer manuellement.
-- **Trivy via snap** : Trivy installé via snap avait un problème de sandbox et pouvait pas accéder aux fichiers Docker. J'ai dû le réinstaller via le script officiel.
-- **SSH Azure** : impossible de SSH dans le conteneur sur App Service parce que notre image n'a pas de serveur SSH. J'ai contourné en ajoutant un script `start.sh` qui fait le migrate + seed au démarrage.
-- **Settings Azure écrasés** : une commande `az webapp config appsettings set` écrasait les settings existants, il fallait tout remettre d'un coup.
