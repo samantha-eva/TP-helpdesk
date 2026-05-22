@@ -199,3 +199,21 @@ export function middleware(request: NextRequest) {
   return response;
 }
 ```
+
+---
+
+## ÉTAPE 5 — CI/CD GitHub Actions
+
+### Question 17 : Pourquoi le job `deploy` a `needs: [test, security, docker]` ?
+
+C'est pour dire que le deploy ne se lance que si les 3 autres jobs ont réussi avant. Ça évite de déployer en prod du code qui a des tests qui cassent, des failles de sécu, ou une image Docker qui build pas. C'est un peu le principe du pipeline : chaque étape valide quelque chose, et si ça passe pas on déploie pas.
+
+### Question 18 : Que fait `if: github.ref == 'refs/heads/main'` ?
+
+Ça fait que le job `deploy` se lance **uniquement** quand on push sur la branche `main`. Si on push sur `develop` ou sur une autre branche, les jobs test/security/docker tournent mais le deploy est skip. C'est logique parce qu'on veut pas déployer en prod à chaque commit sur une branche de dev.
+
+### Question 19 : `continue-on-error: true` est-ce une bonne pratique ?
+
+C'est utilisé sur le job `security` (npm audit et Trivy). Ça veut dire que même si l'audit trouve des vulnérabilités, le pipeline continue et passe pas en rouge.
+
+C'est pratique pour pas bloquer le développement quand y'a des vulnérabilités dans des dépendances qu'on peut pas forcément corriger tout de suite (genre Next.js 14 qui a des CVE mais on peut pas migrer vers la 15 en 5 min). Mais c'est pas top comme pratique parce que du coup on peut ignorer des failles critiques sans s'en rendre compte. L'idéal ce serait de mettre `continue-on-error: false` et de gérer les exceptions au cas par cas, ou de filtrer par niveau de sévérité.
