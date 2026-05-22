@@ -197,3 +197,81 @@ export function middleware(request: NextRequest) {
   return response;
 }
 ```
+
+---
+
+## ÉTAPE 5 — CI/CD GitHub Actions
+
+### Question 17 : Pourquoi le job `deploy` a `needs: [test, security, docker]` ?
+
+C'est pour dire que le deploy ne se lance que si les 3 autres jobs ont réussi avant. Ça évite de déployer en prod du code qui a des tests qui cassent, des failles de sécu, ou une image Docker qui build pas. C'est le principe du pipeline : chaque étape valide quelque chose, et si ça passe pas on déploie pas.
+
+### Question 18 : Que fait `if: github.ref == 'refs/heads/main'` ?
+
+Ça fait que le job `deploy` se lance **uniquement** quand on push sur la branche `main`. Si on push sur `develop` ou sur une autre branche, les jobs test/security/docker tournent mais le deploy est skip. C'est logique parce qu'on veut pas déployer en prod à chaque commit sur une branche de dev.
+
+### Question 19 : `continue-on-error: true` est-ce une bonne pratique ?
+
+C'est utilisé sur le job `security` (npm audit et Trivy). Ça veut dire que même si l'audit trouve des vulnérabilités, le pipeline continue et passe pas en rouge.
+
+C'est pratique pour pas bloquer le développement quand y'a des vulnérabilités dans des dépendances qu'on peut pas corriger tout de suite (genre Next.js 14 qui a des CVE mais on peut pas migrer vers la 15 en 5 min). Mais c'est pas top comme pratique parce que du coup on peut ignorer des failles critiques sans s'en rendre compte. L'idéal ce serait de mettre `continue-on-error: false` et de gérer les exceptions au cas par cas.
+
+### Bonus — CI/CD deploy automatique
+
+J'ai essayé de configurer le déploiement automatique via GitHub Actions. J'ai ajouté les secrets `ACR_LOGIN_SERVER`, `ACR_USERNAME`, `ACR_PASSWORD` et `AZURE_WEBAPP_NAME` dans GitHub. Par contre pour `AZURE_CREDENTIALS` il faut créer un service principal avec `az ad sp create-for-rbac`, et mon compte Azure for Students n'a pas les permissions pour ça (erreur "Insufficient privileges"). Du coup le job deploy ne peut pas se lancer automatiquement, mais le déploiement manuel via `docker push` + `az webapp restart` fonctionne.
+
+---
+
+## ÉTAPE 6 — Déploiement Azure
+
+L'app est déployée sur **Azure App Service** via **Azure Container Registry**.
+
+- URL : https://helpdesk-st.azurewebsites.net
+- Le healthcheck répond `{"status":"ok"}`
+- On peut se connecter et créer des tickets
+
+---
+
+## Synthèse finale
+
+### 1. Architecture finale
+
+```
+Dev local          GitHub              CI/CD                 Azure
+─────────         ────────           ─────────            ──────────
+
+ Code        ──>  git push   ──>   GitHub Actions    ──>  ACR (registry)
+ Next.js           main             - test (lint+unit)      │
+ Prisma                              - security (audit)      │
+ SQLite                              - docker (build)        v
+                                     - deploy           App Service (B1)
+                                                         helpdesk-st
+                                                        .azurewebsites.net
+```
+
+En gros : je code en local, je push sur GitHub, la CI lance les tests + l'audit sécu + le build Docker. Si tout passe et qu'on est sur main, ça pousse l'image sur ACR et ça redéploie sur App Service.
+
+### 2. 3 améliorations DevSecOps
+
+1. **Azure Key Vault pour les secrets** : là le JWT_SECRET est en clair dans les app settings. Avec Key Vault on le stocke dans un coffre-fort chiffré et l'app le récupère au runtime. C'est plus sécurisé si quelqu'un accède au portail Azure.
+
+2. **Monitoring avec Application Insights** : pour l'instant on a aucune visibilité sur ce qui se passe en prod. Avec App Insights on aurait les temps de réponse, les erreurs, l'utilisation CPU/RAM en temps réel, et des alertes si ça dépasse un seuil.
+
+3. **Remplacer SQLite par PostgreSQL** : SQLite c'est bien pour le dev mais en prod ça gère pas les accès concurrents (on l'a vu avec k6, le p95 explose). Avec un vrai PostgreSQL (Azure Database for PostgreSQL) les perfs seraient bien meilleures.
+
+### 3. Coût Azure estimé
+
+- **App Service Plan B1** : ~13€/mois
+- **Container Registry Basic** : ~5€/mois
+- **Total** : ~18€/mois
+
+Avec les 100$ de crédit étudiant, ça tient environ 5 mois. Pour le TP ça a coûté quasi rien vu que c'est quelques heures d'utilisation.
+
+### 4. Difficultés rencontrées
+
+- **Port 3000 occupé** : le serveur Next.js en mode dev bloquait le port, j'ai dû le kill avant de lancer le conteneur Docker.
+- **Prisma dans le conteneur** : `npx prisma` téléchargeait la v7 alors que le projet utilise la v5.22. Il fallait préciser `npx prisma@5.22.0`.
+- **bcryptjs manquant** : le build standalone de Next.js n'inclut pas bcryptjs, donc le seed crashait dans le conteneur.
+- **Trivy via snap** : Trivy installé via snap pouvait pas accéder aux fichiers Docker à cause du sandbox. J'ai dû le réinstaller via le script officiel.
+- **SSH Azure impossible** : notre image Docker n'a pas de serveur SSH. J'ai contourné en ajoutant un script `start.sh` qui fait le migrate + seed au démarrage.
+- **Azure for Students limité** : impossible de créer un service principal pour le deploy automatique en CI.
