@@ -109,3 +109,93 @@ Pendant le load test, j'ai lancé `docker stats helpdesk-app` dans un autre term
 - **RAM** : ~580 MiB
 
 Ça montre que l'app consomme pas mal de ressources sous charge. Le CPU explose surtout à cause des écritures SQLite qui bloquent les unes les autres (pas de vrai accès concurrent en écriture avec SQLite).
+
+---
+
+## ÉTAPE 4 — Sécurité
+
+### Question 12 : Vulnérabilités `npm audit`
+
+J'ai lancé `npm audit` et j'ai **11 vulnérabilités** au total : 7 moderate et 4 high. Pas de critique.
+
+Les principales :
+- **Next.js (14.2.33)** : y'a plein de CVE dessus, surtout des DoS via les Server Components et du cache poisoning. Par exemple GHSA-mwv6-3258-q52c, un attaquant peut envoyer des requêtes bizarres qui font planter les Server Components → l'app devient inaccessible. C'est corrigé dans Next 14.2.34 mais on est bloqué sur la 14.2.33.
+- **glob (10.4.2)** — CVE-2025-64756 : c'est une injection de commande via des noms de fichiers malicieux. En gros si l'app traite des fichiers avec des noms spéciaux ça peut exécuter du code.
+
+### Question 13 : Vulnérabilités Trivy vs npm audit
+
+Trivy trouve **18 vulnérabilités HIGH** dans l'image Docker. Ce qui est intéressant c'est que certaines apparaissent pas du tout dans `npm audit` :
+
+- **cross-spawn (7.0.3)** — CVE-2024-21538 : un ReDoS (l'attaquant envoie une string qui fait boucler la regex). C'est utilisé par npm dans l'image, pas par notre app directement.
+- **tar (6.2.1)** : 6 CVEs, que des failles de path traversal. Un attaquant pourrait écraser des fichiers en créant des archives piégées. Ça vient de npm dans `/usr/local/lib/node_modules/npm/`.
+- **minimatch (9.0.5)** : 3 CVEs de DoS, des regex qui partent en boucle infinie avec certains patterns.
+
+En fait ces failles viennent pas de notre code, elles sont dans **l'image de base node:20-alpine** et dans les outils pré-installés (npm, yarn). `npm audit` les voit pas parce qu'il regarde que les dépendances de notre `package.json`, pas ce qui est installé dans l'OS de l'image Docker.
+
+### Exercice 4.3.1 — JWT secret faible
+
+J'ai récupéré mon token USER via `localStorage.getItem('token')` dans la console du navigateur. Sur jwt.io, j'ai vu le payload en clair avec `"role": "USER"`.
+
+Le truc c'est que le secret dans `.env.example` est `change-me-in-production-use-a-strong-secret-key-please`, et c'est le même qui est utilisé. Du coup j'ai changé le rôle en `"ADMIN"`, resigné avec ce secret, et avec le nouveau token j'ai pu :
+- Voir **tous** les tickets (alors que normalement un USER voit que les siens)
+- **Supprimer** un ticket avec `DELETE /api/tickets/<id>` → ça renvoie `{"ok":true}`
+
+Ça marche parce que l'app vérifie juste la signature du JWT et fait confiance au rôle qui est dedans sans vérifier en base.
+
+**3 trucs à faire pour corriger ça :**
+1. Mettre un vrai secret aléatoire et long (avec `openssl rand -base64 64` par exemple), pas le même que celui de l'example
+2. Vérifier le rôle en base de données à chaque requête importante, pas juste se fier au JWT
+3. Réduire la durée du token (1h au lieu de 7 jours) et utiliser des refresh tokens
+
+### Exercice 4.3.2 — IDOR (Authorization bypass)
+
+J'ai testé en tant que `user@helpdesk.io` d'accéder au ticket d'un autre utilisateur et j'ai eu un 403 Forbidden. L'API est bien protégée contre l'IDOR.
+
+Dans le code (`src/app/api/tickets/[id]/route.ts` lignes 28-29) :
+
+```typescript
+if (auth.role === 'USER' && ticket.authorId !== auth.userId) {
+  return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
+}
+```
+
+En gros, un USER peut voir/modifier que ses propres tickets. Les AGENT et ADMIN voient tout, ce qui est normal pour le support.
+
+### Exercice 4.3.3 — Headers de sécurité manquants
+
+J'ai fait `curl -I http://localhost:3000` et voilà ce que j'ai eu :
+
+```
+HTTP/1.1 200 OK
+Vary: RSC, Next-Router-State-Tree, Next-Router-Prefetch, Accept-Encoding
+x-nextjs-cache: HIT
+Cache-Control: s-maxage=31536000, stale-while-revalidate
+Content-Type: text/html; charset=utf-8
+```
+
+### Question 16 : Headers manquants
+
+Y'a aucun header de sécurité, il manque :
+- **Content-Security-Policy (CSP)** : ça empêche le chargement de scripts non autorisés, ça protège contre le XSS
+- **X-Frame-Options** : ça empêche quelqu'un de mettre notre site dans une iframe pour faire du clickjacking
+- **Strict-Transport-Security (HSTS)** : ça force le HTTPS, comme ça même si quelqu'un tape http:// il est redirigé
+- **X-Content-Type-Options** : ça empêche le navigateur de deviner le type de fichier, sinon il pourrait exécuter un fichier malicieux
+
+Pour corriger ça on peut ajouter un middleware Next.js :
+
+```typescript
+// src/middleware.ts
+import { NextResponse } from 'next/server';
+import type { NextRequest } from 'next/server';
+
+export function middleware(request: NextRequest) {
+  const response = NextResponse.next();
+
+  response.headers.set('X-Frame-Options', 'DENY');
+  response.headers.set('X-Content-Type-Options', 'nosniff');
+  response.headers.set('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+  response.headers.set('Content-Security-Policy', "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'");
+
+  return response;
+}
+```
